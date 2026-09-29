@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Murmuration</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1233; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #hud {
+    position: fixed; left: 16px; bottom: 14px; right: 16px;
+    font: 12px/1.4 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: .08em; text-transform: uppercase;
+    color: rgba(255, 226, 200, .55); pointer-events: none;
+    display: flex; justify-content: space-between; gap: 12px;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><span>400 starlings</span><span>click or tap: send the falcon</span></div>
+
+<script>
+(() => {
+  const N = 400;
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  let W, H, DPR, bg, bgx, horizon;
+
+  // ---- world parameters (world y is up) ------------------------------
+  const K = 7;                 // topological neighbours, as real starlings use
+  const NEIGHBOR_R = 110, SEP_R = 16;
+  const MIN_SPEED = 2.4, MAX_SPEED = 4.3;
+  const FLOOR = -150, CEIL = 230;
+  const CAM_DIST = 720;
+
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const birds = [];
+  for (let i = 0; i < N; i++) {
+    const a = rnd(0, Math.PI * 2), r = rnd(0, 60);
+    birds.push({
+      x: Math.cos(a) * r, y: rnd(-40, 40), z: Math.sin(a) * r,
+      vx: 3, vy: 0, vz: 0.5, phase: rnd(0, 6.28), rate: rnd(0.55, 0.75),
+      ax: 0, ay: 0, az: 0
+    });
+  }
+
+  // spatial hash for neighbour lookups
+  const CELL = NEIGHBOR_R;
+  let grid = new Map();
+  const key = (i, j, k) => (i + 512) * 1048576 + (j + 512) * 1024 + (k + 512);
+
+  // roost attractor wandering on a Lissajous path
+  const target = { x: 0, y: 0, z: 0 };
+  // falcon
+  const falcon = { on: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, life: 0, phase: 0 };
+  const centroid = { x: 0, y: 0, z: 0 };
+  const cam = { x: 0, y: 0, z: 0 };
+  let time = 0, nextFalcon = 9, yaw = 0;
+
+  function launchFalcon() {
+    const a = rnd(0, Math.PI * 2), d = 650;
+    falcon.on = true;
+    falcon.x = centroid.x + Math.cos(a) * d;
+    falcon.z = centroid.z + Math.sin(a) * d;
+    falcon.y = centroid.y + rnd(60, 180);
+    const tx = centroid.x + rnd(-40, 40) - falcon.x;
+    const ty = centroid.y + rnd(-30, 30) - falcon.y;
+    const tz = centroid.z + rnd(-40, 40) - falcon.z;
+    const l = Math.hypot(tx, ty, tz), sp = 7.5;
+    falcon.vx = tx / l * sp; falcon.vy = ty / l * sp; falcon.vz = tz / l * sp;
+    falcon.life = 0;
+  }
+
+  function step(k) {
+    time += k / 60;
+
+    // wandering roost target
+    target.x = Math.sin(time * 0.21) * 340;
+    target.z = Math.sin(time * 0.27 + 1.3) * 340;
+    target.y = Math.sin(time * 0.33 + 0.4) * 110 + 30;
+
+    // falcon
+    if (falcon.on) {
+      falcon.x += falcon.vx * k; falcon.y += falcon.vy * k; falcon.z += falcon.vz * k;
+      falcon.life += k; falcon.phase += 0.5 * k;
+      if (falcon.life > 240) falcon.on = false;
+    } else if (time > nextFalcon) {
+      launchFalcon();
+      nextFalcon = time + rnd(14, 22);
+    }
+
+    // rebuild grid
+    grid.clear();
+    for (let n = 0; n < N; n++) {
+      const b = birds[n];
+      const id = key(Math.floor(b.x / CELL), Math.floor(b.y / CELL), Math.floor(b.z / CELL));
+      let c = grid.get(id);
+      if (!c) grid.set(id, c = []);
+      c.push(n);
+    }
+
+    let cx = 0, cy = 0, cz = 0;
+    const nd = new Float32Array(K), ni = new Int32Array(K);
+
+    for (let n = 0; n < N; n++) {
+      const b = birds[n];
+      cx += b.x; cy += b.y; cz += b.z;
+
+      // K nearest neighbours within radius
+      let cnt = 0;
+      const gi = Math.floor(b.x / CELL), gj = Math.floor(b.y / CELL), gk = Math.floor(b.z / CELL);
+      for (let i = gi - 1; i <= gi + 1; i++)
+        for (let j = gj - 1; j <= gj + 1; j++)
+          for (let l = gk - 1; l <= gk + 1; l++) {
+            const c = grid.get(key(i, j, l));
+            if (!c) continue;
+            for (let m = 0; m < c.length; m++) {
+              const o = c[m]; if (o === n) continue;
+              const q = birds[o];
+              const dx = q.x - b.x, dy = q.y - b.y, dz = q.z - b.z;
+              const d2 = dx * dx + dy * dy + dz * dz;
+              if (d2 > NEIGHBOR_R * NEIGHBOR_R) continue;
+              if (cnt < K) cnt++;
+              else if (d2 >= nd[K - 1]) continue;
+              let p = cnt - 1;
+              while (p > 0 && nd[p - 1] > d2) { nd[p] = nd[p - 1]; ni[p] = ni[p - 1]; p--; }
+              nd[p] = d2; ni[p] = o;
+            }
+          }
+
+      let ax = 0, ay = 0, az = 0;
+      if (cnt) {
+        let mx = 0, my = 0, mz = 0, mvx = 0, mvy = 0, mvz = 0;
+        for (let m = 0; m < cnt; m++) {
+          const q = birds[ni[m]];
+          mx += q.x; my += q.y; mz += q.z;
+          mvx += q.vx; mvy += q.vy; mvz += q.vz;
+          const d = Math.sqrt(nd[m]);
+          if (d < SEP_R && d > 0.001) {
+            const f = (SEP_R - d) / SEP_R * 0.28 / d;
+            ax -= (q.x - b.x) * f; ay -= (q.y - b.y) * f; az -= (q.z - b.z) * f;
+          }
+        }
+        mx /= cnt; my /= cnt; mz /= cnt; mvx /= cnt; mvy /= cnt; mvz /= cnt;
+        ax += (mvx - b.vx) * 0.12 + (mx - b.x) * 0.0018;
+        ay += (mvy - b.vy) * 0.12 + (my - b.y) * 0.0018;
+        az += (mvz - b.vz) * 0.12 + (mz - b.z) * 0.0018;
+      }
+
+      // pull toward the roost target
+      {
+        const dx = target.x - b.x, dy = target.y - b.y, dz = target.z - b.z;
+        const d = Math.hypot(dx, dy, dz) + 0.001;
+        const f = 0.014 * Math.min(d / 160, 1.6) / d;
+        ax += dx * f; ay += dy * f; az += dz * f;
+      }
+      // gentle pull to the flock's own centre keeps it from tearing apart
+      {
+        const dx = centroid.x - b.x, dy = centroid.y - b.y, dz = centroid.z - b.z;
+        const d = Math.hypot(dx, dy, dz);
+        if (d > 150) { const f = 0.0018 * (d - 150) / d; ax += dx * f; ay += dy * f; az += dz * f; }
+      }
+      // stay above the ground
+      if (b.y < FLOOR) ay += (FLOOR - b.y) * 0.02;
+      if (b.y > CEIL) ay -= (b.y - CEIL) * 0.02;
+
+      // falcon panic
+      if (falcon.on) {
+        const dx = b.x - falcon.x, dy = b.y - falcon.y, dz = b.z - falcon.z;
+        const d = Math.hypot(dx, dy, dz);
+        if (d < 190 && d > 0.001) {
+          const f = (1 - d / 190) * 0.55 / d;
+          ax += dx * f; ay += dy * f; az += dz * f;
+        }
+      }
+
+      // a little noise
+      ax += rnd(-0.012, 0.012); ay += rnd(-0.012, 0.012); az += rnd(-0.012, 0.012);
+      b.ax = ax; b.ay = ay; b.az = az;
+    }
+
+    centroid.x = cx / N; centroid.y = cy / N; centroid.z = cz / N;
+
+    for (let n = 0; n < N; n++) {
+      const b = birds[n];
+      b.vx += b.ax * k; b.vy += b.ay * k; b.vz += b.az * k;
+      let s = Math.hypot(b.vx, b.vy, b.vz);
+      const t = falcon.on ? MAX_SPEED * 1.15 : MAX_SPEED;
+      const c = s > t ? t / s : s < MIN_SPEED ? MIN_SPEED / (s + 0.001) : 1;
+      b.vx *= c; b.vy *= c; b.vz *= c;
+      b.x += b.vx * k; b.y += b.vy * k; b.z += b.vz * k;
+      b.phase += (b.rate + s * 0.02) * k;
+    }
+
+    // camera slowly circles the flock, smoothly following its centre
+    const f = 1 - Math.pow(0.972, k);
+    cam.x += (centroid.x - cam.x) * f;
+    cam.y += (centroid.y - cam.y) * f;
+    cam.z += (centroid.z - cam.z) * f;
+    yaw = Math.sin(time * 0.05) * 0.6;
+  }
+
+  // ---- rendering -----------------------------------------------------
+  function buildBackground() {
+    bg = document.createElement('canvas');
+    bg.width = cv.width; bg.height = cv.height;
+    bgx = bg.getContext('2d');
+    const w = bg.width, h = bg.height;
+    horizon = h * 0.8;
+
+    const sky = bgx.createLinearGradient(0, 0, 0, horizon);
+    sky.addColorStop(0, '#150f30');
+    sky.addColorStop(0.45, '#4a2a5e');
+    sky.addColorStop(0.75, '#c8536a');
+    sky.addColorStop(1, '#f7a25c');
+    bgx.fillStyle = sky; bgx.fillRect(0, 0, w, h);
+
+    const sun = bgx.createRadialGradient(w * 0.68, horizon, 0, w * 0.68, horizon, h * 0.55);
+    sun.addColorStop(0, 'rgba(255,236,170,.95)');
+    sun.addColorStop(0.08, 'rgba(255,200,120,.65)');
+    sun.addColorStop(0.4, 'rgba(255,140,100,.2)');
+    sun.addColorStop(1, 'rgba(255,140,100,0)');
+    bgx.fillStyle = sun; bgx.fillRect(0, 0, w, h);
+
+    // hills
+    const hill = (base, amp, col, seed) => {
+      bgx.fillStyle = col; bgx.beginPath(); bgx.moveTo(0, h);
+      for (let x = 0; x <= w; x += 4) {
+        const y = base + Math.sin(x * 0.004 + seed) * amp + Math.sin(x * 0.011 + seed * 2) * amp * 0.4;
+        bgx.lineTo(x, y);
+      }
+      bgx.lineTo(w, h); bgx.fill();
+    };
+    hill(horizon - 8, h * 0.02, '#5a2f52', 1);
+    hill(horizon + h * 0.03, h * 0.025, '#2d1a3d', 4);
+    hill(horizon + h * 0.08, h * 0.02, '#160e26', 9);
+
+    // reeds and bare trees on the near ridge
+    bgx.strokeStyle = '#160e26'; bgx.lineWidth = Math.max(1, h * 0.0022);
+    for (let i = 0; i < 90; i++) {
+      const x = Math.random() * w, y = horizon + h * 0.085 + Math.random() * h * 0.02;
+      const len = h * (0.02 + Math.random() * 0.05);
+      bgx.beginPath(); bgx.moveTo(x, y + 4); bgx.quadraticCurveTo(x + rnd(-6, 6), y - len * 0.5, x + rnd(-10, 10), y - len); bgx.stroke();
+    }
+  }
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    buildBackground();
+  }
+  addEventListener('resize', resize);
+  cv.addEventListener('pointerdown', () => { if (!falcon.on) launchFalcon(); });
+
+  function draw() {
+    const w = cv.width, h = cv.height;
+    // partial repaint of the sky leaves soft motion trails
+    ctx.globalAlpha = 0.5;
+    ctx.drawImage(bg, 0, 0);
+    ctx.globalAlpha = 1;
+
+    const cy = h * 0.42, cx = w / 2;
+    const f = Math.min(h * 1.7, w * 1.4);
+    const cs = Math.cos(yaw), sn = Math.sin(yaw);
+
+    // returns [sx, sy, depth]
+    const P = [0, 0, 0];
+    const proj = (x, y, z) => {
+      const dx = x - cam.x, dz = z - cam.z;
+      const rx = cs * dx - sn * dz;
+      const rz = sn * dx + cs * dz + CAM_DIST;
+      const s = f / Math.max(rz, 60);
+      P[0] = cx + rx * s; P[1] = cy - (y - cam.y) * s; P[2] = rz;
+    };
+
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const span = 3.6;
+
+    const bird = (x, y, z, vx, vy, vz, phase, sc, alphaMul) => {
+      // side vector = velocity x up
+      let sx = vz, sz = -vx;
+      const sl = Math.hypot(sx, sz) || 1;
+      sx = sx / sl * span * sc; sz = sz / sl * span * sc;
+      const flap = Math.sin(phase) * span * 0.55 * sc;
+      proj(x, y, z);
+      const c0 = P[0], c1 = P[1], depth = P[2];
+      proj(x + sx, y + flap, z + sz); const ax = P[0], ay = P[1];
+      proj(x - sx, y + flap, z - sz); const bx = P[0], by = P[1];
+      const t = Math.min(Math.max((depth - (CAM_DIST - 320)) / 640, 0), 1);
+      const a = (0.95 - t * 0.55) * alphaMul;
+      const s = f / Math.max(depth, 60);
+      ctx.strokeStyle = `rgba(14,8,28,${a})`;
+      ctx.lineWidth = Math.max(0.9 * DPR, s * 2.1 * sc);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.lineTo(c0, c1); ctx.lineTo(bx, by);
+      ctx.stroke();
+    };
+
+    // far-to-near for correct overlap is unnecessary with uniform ink; skip sorting
+    for (let n = 0; n < N; n++) {
+      const b = birds[n];
+      bird(b.x, b.y, b.z, b.vx, b.vy, b.vz, b.phase, 1, 1);
+    }
+
+    if (falcon.on) {
+      const fade = Math.min(1, falcon.life / 20, (240 - falcon.life) / 30);
+      bird(falcon.x, falcon.y, falcon.z, falcon.vx, falcon.vy, falcon.vz, falcon.phase, 2.4, fade);
+    }
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    step(dt * 60);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  // warm up so the first frame already looks like a flock
+  for (let i = 0; i < 240; i++) step(1);
+  requestAnimationFrame(frame);
+
+  // exposed for quick inspection from the console
+  window.__murmuration = { birds, centroid, falcon, launchFalcon };
+})();
+</script>
+</body>
+</html>
